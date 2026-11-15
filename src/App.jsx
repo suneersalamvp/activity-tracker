@@ -11,12 +11,12 @@ import { isSupabaseConfigured, supabase } from './supabase.js'
 
 const STATUSES = [
   'Note started', 'In progress', 'Processing', 'Under review', 'Blocked',
-  'On hold', 'Completed', 'Delivered', 'Final check', 'Closed',
+  'On hold', 'Completed', 'Delivered', 'Final check', 'Closed', 'Resolved',
 ]
 const SEVERITIES = ['Low', 'Medium', 'High', 'Critical']
 const SIZES = ['XS', 'S', 'M', 'L', 'XL']
 const COLORS = ['#5b67e8', '#238b75', '#df8c46', '#9b68ce', '#d85c73', '#4886c7']
-const DONE = new Set(['Completed', 'Delivered', 'Closed'])
+const DONE = new Set(['Completed', 'Delivered', 'Closed', 'Resolved'])
 
 function localDateString(date = new Date()) {
   const year = date.getFullYear()
@@ -49,6 +49,17 @@ function isDueThisWeek(value) {
 
 function dateIsOverdue(task) {
   return Boolean(task.due_date && task.due_date < localDateString() && !DONE.has(task.status))
+}
+
+function reminderTimes(task) {
+  if (!task.due_date || DONE.has(task.status)) return []
+  const dueAt = new Date(`${task.due_date}T${task.due_time || '23:59'}:00`)
+  if (Number.isNaN(dueAt.getTime())) return []
+  const createdAt = new Date(task.created_at || Date.now())
+  const times = []
+  if (task.due_date > localDateString(createdAt)) times.push({ kind: 'day', at: new Date(dueAt.getTime() - 24 * 60 * 60 * 1000), text: `${task.title} is due tomorrow` })
+  if (task.due_time) times.push({ kind: 'time', at: new Date(dueAt.getTime() - 3 * 60 * 60 * 1000), text: `${task.title} is due in 3 hours` })
+  return times.filter((item) => item.at >= createdAt && item.at < dueAt)
 }
 
 function statusClass(status) {
@@ -88,6 +99,8 @@ export default function App() {
   const [profiles, setProfiles] = useState([])
   const [projects, setProjects] = useState([])
   const [tasks, setTasks] = useState([])
+  const [projectStatuses, setProjectStatuses] = useState([])
+  const [checklists, setChecklists] = useState([])
   const [events, setEvents] = useState([])
   const [signedImages, setSignedImages] = useState({})
   const [loading, setLoading] = useState(true)
@@ -111,6 +124,25 @@ export default function App() {
     setToast({ message, tone })
     window.setTimeout(() => setToast(null), 3600)
   }, [])
+
+  useEffect(() => {
+    if (!user || !tasks.length) return undefined
+    const checkReminders = () => {
+      const now = Date.now()
+      const seen = JSON.parse(localStorage.getItem('flowboard-reminders') || '{}')
+      for (const task of tasks) for (const reminder of reminderTimes(task)) {
+        const key = `${task.id}:${reminder.kind}:${task.due_date}:${task.due_time || ''}`
+        if (seen[key] || reminder.at.getTime() > now || new Date(`${task.due_date}T${task.due_time || '23:59'}:00`).getTime() <= now) continue
+        seen[key] = true
+        if ('Notification' in window && Notification.permission === 'granted') new Notification('Flowboard reminder', { body: reminder.text })
+        else notify(reminder.text, 'success')
+      }
+      localStorage.setItem('flowboard-reminders', JSON.stringify(seen))
+    }
+    checkReminders()
+    const timer = window.setInterval(checkReminders, 60_000)
+    return () => window.clearInterval(timer)
+  }, [user?.id, tasks, notify])
 
   useEffect(() => {
     if (!supabase) {
@@ -143,14 +175,16 @@ export default function App() {
     if (!supabase || !user) return
     if (showSpinner) setDataLoading(true)
     setPageError('')
-    const [profileResult, peopleResult, projectResult, taskResult, eventResult] = await Promise.all([
+    const [profileResult, peopleResult, projectResult, taskResult, eventResult, statusResult, checklistResult] = await Promise.all([
       supabase.from('profiles').select('id,email,display_name,role,created_at').order('created_at'),
       supabase.from('profiles').select('id,email,display_name,role').order('display_name'),
       supabase.from('projects').select('*').order('updated_at', { ascending: false }),
       supabase.from('tasks').select('*').order('updated_at', { ascending: false }),
       supabase.from('activity_events').select('*').order('created_at', { ascending: false }).limit(14),
+      supabase.from('project_statuses').select('*').order('position'),
+      supabase.from('checklist_items').select('*').order('position'),
     ])
-    const resultError = [profileResult, peopleResult, projectResult, taskResult, eventResult].find((result) => result.error)?.error
+    const resultError = [profileResult, peopleResult, projectResult, taskResult, eventResult, statusResult, checklistResult].find((result) => result.error)?.error
     if (resultError) {
       setPageError(errorMessage(resultError))
       setDataLoading(false)
@@ -161,6 +195,8 @@ export default function App() {
     setProjects(projectResult.data ?? [])
     setTasks(taskResult.data ?? [])
     setEvents(eventResult.data ?? [])
+    setProjectStatuses(statusResult.data ?? [])
+    setChecklists(checklistResult.data ?? [])
     const imageRows = (taskResult.data ?? []).filter((item) => item.image_path)
     const imagePairs = await Promise.all(imageRows.map(async (item) => {
       const { data, error } = await supabase.storage.from('activity-attachments').createSignedUrl(item.image_path, 3600)
@@ -213,6 +249,38 @@ export default function App() {
     }
   }
 
+  const manageStatus = async (projectId, status, action) => {
+    if (!supabase || !user) return
+    const current = projectStatuses.filter((item) => item.project_id === projectId).sort((a, b) => a.position - b.position)
+    if (action === 'add') {
+      const name = window.prompt('New column name')?.trim()
+      if (!name) return
+      const { error } = await supabase.from('project_statuses').insert({ project_id: projectId, name, position: current.length })
+      if (error) notify(errorMessage(error), 'error'); else { await refreshData(); notify('Column added') }
+      return
+    }
+    if (action === 'rename') {
+      if (status.is_resolved) { notify('Resolved is a permanent column.', 'error'); return }
+      const nextName = window.prompt('Rename column', status.name)?.trim()
+      if (!nextName || nextName === status.name) return
+      const { error } = await supabase.from('project_statuses').update({ name: nextName }).eq('id', status.id)
+      if (error) notify(errorMessage(error), 'error')
+      else {
+        await supabase.from('tasks').update({ status: nextName }).eq('project_id', projectId).eq('status', status.name)
+        await refreshData(); notify('Column renamed')
+      }
+      return
+    }
+    if (action === 'delete') {
+      if (status.is_resolved) { notify('Resolved is a protected column.', 'error'); return }
+      if (!window.confirm(`Delete “${status.name}”? Cards in it will move to Resolved.`)) return
+      const { error: moveError } = await supabase.from('tasks').update({ status: 'Resolved' }).eq('project_id', projectId).eq('status', status.name)
+      if (moveError) { notify(errorMessage(moveError), 'error'); return }
+      const { error } = await supabase.from('project_statuses').delete().eq('id', status.id)
+      if (error) notify(errorMessage(error), 'error'); else { await refreshData(); notify('Column deleted') }
+    }
+  }
+
   const saveTask = async ({ values, file, removeImage, task }) => {
     if (!supabase || !user) return
     const projectId = values.project_id
@@ -230,6 +298,7 @@ export default function App() {
       severity: values.severity,
       size: values.size,
       due_date: values.due_date || null,
+      due_time: values.due_time || null,
       important: Boolean(values.important),
     }
     if (!payload.title) throw new Error('Add a title for this card.')
@@ -266,6 +335,14 @@ export default function App() {
       const { error } = await supabase.from('tasks').update({ image_path: nextImagePath }).eq('id', savedTask.id)
       if (error) throw error
       if (task?.image_path && !movedStoredImage) await supabase.storage.from('activity-attachments').remove([task.image_path])
+    }
+    if (Array.isArray(values.checklist)) {
+      if (task) await supabase.from('checklist_items').delete().eq('task_id', savedTask.id)
+      const rows = values.checklist.map((item, position) => ({ task_id: savedTask.id, title: item.title.trim(), is_done: Boolean(item.is_done), position })).filter((item) => item.title)
+      if (rows.length) {
+        const { error } = await supabase.from('checklist_items').insert(rows)
+        if (error) throw error
+      }
     }
     setModal(null)
     await refreshData()
@@ -341,6 +418,14 @@ export default function App() {
     await refreshData()
   }
 
+  const adminUserAction = async (payload) => {
+    const { data, error } = await supabase.functions.invoke('admin-users', { body: payload })
+    if (error) throw error
+    if (data?.error) throw new Error(data.error)
+    await refreshData()
+    return data
+  }
+
   const signOut = async () => {
     await supabase.auth.signOut()
     setActiveView('dashboard')
@@ -403,7 +488,7 @@ export default function App() {
           <div className="breadcrumbs"><span>Workspace</span><span className="crumb-slash">/</span><strong>{activeProject && activeView === 'board' ? activeProject.name : pageTitle(activeView, isAdmin)}</strong></div>
           <div className="topbar-actions">
             <label className="search-box"><Search size={16} /><input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Search anything…" /><kbd>⌘ K</kbd></label>
-            <button className="icon-button notification-button" title="Open insights" onClick={() => { setActiveView('insights'); setActiveProjectId(null) }}><Bell size={17} />{tasks.some((task) => dateIsOverdue(task) || task.due_date === localDateString()) && <i />}</button>
+            <button className="icon-button notification-button" title="Open insights and enable reminders" onClick={() => { if ('Notification' in window && Notification.permission === 'default') Notification.requestPermission(); setActiveView('insights'); setActiveProjectId(null) }}><Bell size={17} />{tasks.some((task) => dateIsOverdue(task) || task.due_date === localDateString()) && <i />}</button>
             <div className="topbar-divider" />
             <button className="avatar avatar-purple topbar-avatar" title={user.email}>{initials(displayName(profile, user))}</button>
           </div>
@@ -414,18 +499,19 @@ export default function App() {
         <main className="main-content">
           {activeView === 'dashboard' && <DashboardView user={user} profile={profile} projects={projects} tasks={visibleTasks} allTasks={tasks} profiles={profiles} events={events} nameFor={nameFor} onOpenProject={(project) => { setActiveProjectId(project.id); setActiveView('board') }} onNewTask={(projectId, status) => setModal({ type: 'task', projectId, status })} onNewProject={() => setModal({ type: 'project' })} onOpenTask={(task) => setModal({ type: 'task', taskId: task.id })} onOpenInsights={() => setActiveView('insights')} />}
           {activeView === 'projects' && <ProjectsView projects={projects} tasks={visibleTasks} onOpen={(project) => { setActiveProjectId(project.id); setActiveView('board') }} onNew={() => setModal({ type: 'project' })} onEdit={(project) => setModal({ type: 'project', projectId: project.id })} onNewTask={(projectId) => setModal({ type: 'task', projectId })} />}
-          {activeView === 'board' && activeProject && <BoardView project={activeProject} tasks={visibleTasks.filter((task) => task.project_id === activeProject.id)} profiles={profiles} isAdmin={isAdmin} userId={user.id} imageFor={(task) => signedImages[task.id]} onStatus={updateTaskStatus} onNew={(status) => setModal({ type: 'task', projectId: activeProject.id, status })} onOpen={(task) => setModal({ type: 'task', taskId: task.id })} onEditProject={() => setModal({ type: 'project', projectId: activeProject.id })} onDeleteProject={() => deleteProject(activeProject)} />}
+          {activeView === 'board' && activeProject && <BoardView project={activeProject} statuses={projectStatuses.filter((item) => item.project_id === activeProject.id).sort((a, b) => a.position - b.position)} onManageStatus={manageStatus} tasks={visibleTasks.filter((task) => task.project_id === activeProject.id)} profiles={profiles} isAdmin={isAdmin} userId={user.id} imageFor={(task) => signedImages[task.id]} onStatus={updateTaskStatus} onNew={(status) => setModal({ type: 'task', projectId: activeProject.id, status })} onOpen={(task) => setModal({ type: 'task', taskId: task.id })} onEditProject={() => setModal({ type: 'project', projectId: activeProject.id })} onDeleteProject={() => deleteProject(activeProject)} />}
           {activeView === 'board' && !activeProject && <ProjectsView projects={projects} tasks={visibleTasks} onOpen={(project) => { setActiveProjectId(project.id); setActiveView('board') }} onNew={() => setModal({ type: 'project' })} onEdit={(project) => setModal({ type: 'project', projectId: project.id })} onNewTask={(projectId) => setModal({ type: 'task', projectId })} />}
           {activeView === 'insights' && <InsightsView tasks={visibleTasks} profiles={profiles} isAdmin={isAdmin} onOpenTask={(task) => setModal({ type: 'task', taskId: task.id })} />}
-          {activeView === 'team' && isAdmin && <TeamView profiles={profiles} projects={projects} tasks={tasks} userId={user.id} onInvite={() => setModal({ type: 'invite' })} />}
+          {activeView === 'team' && isAdmin && <TeamView profiles={profiles} projects={projects} tasks={tasks} userId={user.id} onInvite={() => setModal({ type: 'invite' })} onCreate={() => setModal({ type: 'create-member' })} onManage={async (payload) => { try { await adminUserAction(payload); notify('Member updated') } catch (error) { notify(errorMessage(error), 'error') } }} />}
           {activeView === 'team' && !isAdmin && <DashboardView user={user} profile={profile} projects={projects} tasks={visibleTasks} allTasks={tasks} profiles={profiles} events={events} nameFor={nameFor} onOpenProject={(project) => { setActiveProjectId(project.id); setActiveView('board') }} onNewTask={(projectId, status) => setModal({ type: 'task', projectId, status })} onNewProject={() => setModal({ type: 'project' })} onOpenTask={(task) => setModal({ type: 'task', taskId: task.id })} onOpenInsights={() => setActiveView('insights')} />}
         </main>
         <footer className="app-footer"><span>Flowboard <span className="footer-dot">•</span> Activity tracker</span><span><ShieldCheck size={13} /> Private workspace</span></footer>
       </div>
 
-      {modal?.type === 'task' && <TaskModal task={modalTask} projects={projects} profiles={profiles} isAdmin={isAdmin} user={user} initialProjectId={modal.projectId} initialStatus={modal.status} imageUrl={modalTask ? signedImages[modalTask.id] : ''} onClose={() => setModal(null)} onSave={saveTask} onDelete={modalTask ? () => deleteTask(modalTask) : null} />}
+      {modal?.type === 'task' && <TaskModal task={modalTask} projects={projects} profiles={profiles} isAdmin={isAdmin} user={user} statuses={projectStatuses.filter((item) => item.project_id === (modalTask?.project_id ?? modal.projectId))} checklist={checklists.filter((item) => item.task_id === modalTask?.id)} initialProjectId={modal.projectId} initialStatus={modal.status} imageUrl={modalTask ? signedImages[modalTask.id] : ''} onClose={() => setModal(null)} onSave={saveTask} onDelete={modalTask ? () => deleteTask(modalTask) : null} />}
       {modal?.type === 'project' && <ProjectModal project={projects.find((item) => item.id === modal.projectId) ?? null} profiles={profiles} isAdmin={isAdmin} user={user} onClose={() => setModal(null)} onSave={saveProject} onDelete={modal.projectId ? () => deleteProject(projects.find((item) => item.id === modal.projectId)) : null} />}
       {modal?.type === 'invite' && <InviteModal onClose={() => setModal(null)} onInvite={inviteUser} />}
+      {modal?.type === 'create-member' && <CreateMemberModal onClose={() => setModal(null)} onCreate={async (values) => { await adminUserAction({ action: 'create', ...values }); setModal(null); notify('Member account created') }} />}
       {toast && <div className={`toast toast-${toast.tone}`}><span className="toast-icon">{toast.tone === 'error' ? <XCircle size={18} /> : <CheckCircle2 size={18} />}</span><span>{toast.message}</span><button className="toast-close" onClick={() => setToast(null)}><X size={15} /></button></div>}
     </div>
   )
@@ -635,7 +721,7 @@ function ProjectsView({ projects, tasks, onOpen, onNew, onEdit, onNewTask }) {
   </div>
 }
 
-function BoardView({ project, tasks, profiles, isAdmin, userId, imageFor, onStatus, onNew, onOpen, onEditProject, onDeleteProject }) {
+function BoardView({ project, statuses, onManageStatus, tasks, profiles, isAdmin, userId, imageFor, onStatus, onNew, onOpen, onEditProject, onDeleteProject }) {
   const [severityFilter, setSeverityFilter] = useState('All priorities')
   const [menuOpen, setMenuOpen] = useState(false)
   const filteredTasks = tasks.filter((task) => severityFilter === 'All priorities' || task.severity === severityFilter)
@@ -644,19 +730,19 @@ function BoardView({ project, tasks, profiles, isAdmin, userId, imageFor, onStat
   const profileFor = (id) => profiles.find((person) => person.id === id)
 
   return <div className="page-view board-page">
-    <div className="board-heading"><div className="board-title-group"><span className="project-cover board-project-cover" style={{ '--project-color': project.color }}><FolderKanban size={21} /></span><div><div className="board-title-line"><h1>{project.name}</h1><span className="board-private"><ShieldCheck size={13} /> Private</span></div><p>{project.description || 'Move your work from the first note to the final check.'}</p></div></div><div className="board-heading-actions"><button className="secondary-button" onClick={onEditProject}><Pencil size={15} /> Edit project</button><div className="menu-wrap"><button className="icon-button" onClick={() => setMenuOpen((value) => !value)}><MoreHorizontal size={18} /></button>{menuOpen && <div className="floating-menu"><button className="danger-menu-item" onClick={() => { setMenuOpen(false); onDeleteProject() }}><Trash2 size={15} /> Delete project</button></div>}</div><button className="primary-button" onClick={() => onNew('Note started')}><Plus size={16} /> Add activity</button></div></div>
+    <div className="board-heading"><div className="board-title-group"><span className="project-cover board-project-cover" style={{ '--project-color': project.color }}><FolderKanban size={21} /></span><div><div className="board-title-line"><h1>{project.name}</h1><span className="board-private"><ShieldCheck size={13} /> Private</span></div><p>{project.description || 'Move your work from the first note to the final check.'}</p></div></div><div className="board-heading-actions"><button className="secondary-button" onClick={() => onManageStatus(project.id, null, 'add')}><Plus size={15} /> Add column</button><button className="secondary-button" onClick={onEditProject}><Pencil size={15} /> Edit project</button><div className="menu-wrap"><button className="icon-button" onClick={() => setMenuOpen((value) => !value)}><MoreHorizontal size={18} /></button>{menuOpen && <div className="floating-menu"><button className="danger-menu-item" onClick={() => { setMenuOpen(false); onDeleteProject() }}><Trash2 size={15} /> Delete project</button></div>}</div><button className="primary-button" onClick={() => onNew(statuses[0]?.name || 'Note started')}><Plus size={16} /> Add activity</button></div></div>
     <div className="board-summary-strip"><div><span className="summary-point point-blue" />{tasks.length} activities</div><span className="summary-separator" /><div><span className="summary-point point-amber" />{tasks.filter((task) => !DONE.has(task.status)).length} in progress</div><span className="summary-separator" /><div><span className="summary-point point-green" />{doneCount} completed</div><div className="board-progress-summary"><span>{progress}% complete</span><span className="board-progress-track"><i style={{ width: `${progress}%` }} /></span></div><div className="board-controls"><button className="filter-button" onClick={() => setSeverityFilter((current) => current === 'All priorities' ? 'High' : current === 'High' ? 'Critical' : current === 'Critical' ? 'Medium' : current === 'Medium' ? 'Low' : 'All priorities')}><Filter size={14} /> {severityFilter} <ChevronDown size={13} /></button><div className="avatar-stack board-avatar-stack">{profiles.slice(0, 4).map((person, index) => <span className={`avatar avatar-stack-item avatar-tone-${index % 4}`} title={person.display_name || person.email} key={person.id}>{initials(person.display_name || person.email)}</span>)}</div></div></div>
-    <div className="board-scroll"><div className="kanban-board">{STATUSES.map((status) => {
-      const columnTasks = filteredTasks.filter((task) => task.status === status).sort((a, b) => a.position - b.position || a.created_at.localeCompare(b.created_at))
-      return <BoardColumn key={status} status={status} tasks={columnTasks} project={project} userId={userId} isAdmin={isAdmin} imageFor={imageFor} profileFor={profileFor} onStatus={onStatus} onNew={onNew} onOpen={onOpen} />
+    <div className="board-scroll"><div className="kanban-board">{statuses.map((status) => {
+      const columnTasks = filteredTasks.filter((task) => task.status === status.name).sort((a, b) => a.position - b.position || a.created_at.localeCompare(b.created_at))
+      return <BoardColumn key={status.id} status={status.name} statusRecord={status} tasks={columnTasks} project={project} userId={userId} isAdmin={isAdmin} imageFor={imageFor} profileFor={profileFor} onManageStatus={onManageStatus} onStatus={onStatus} onNew={onNew} onOpen={onOpen} />
     })}</div></div>
   </div>
 }
 
-function BoardColumn({ status, tasks, project, userId, isAdmin, imageFor, profileFor, onStatus, onNew, onOpen }) {
+function BoardColumn({ status, statusRecord, tasks, project, userId, isAdmin, imageFor, profileFor, onManageStatus, onStatus, onNew, onOpen }) {
   const [isOver, setIsOver] = useState(false)
   return <section className={`board-column ${isOver ? 'column-drop-over' : ''}`} onDragOver={(event) => { event.preventDefault(); setIsOver(true) }} onDragLeave={(event) => { if (!event.currentTarget.contains(event.relatedTarget)) setIsOver(false) }} onDrop={(event) => { event.preventDefault(); setIsOver(false); const taskId = event.dataTransfer.getData('text/plain'); const task = document.getElementById(`task-${taskId}`); if (taskId && task?.dataset.status !== status) onStatus({ id: taskId }, status) }}>
-    <div className="column-header"><div className={`column-status-icon status-${statusClass(status)}`}><ColumnIcon status={status} /></div><strong>{status}</strong><span className="column-count">{tasks.length}</span><button className="tiny-icon-button column-add" title={`Add to ${status}`} onClick={() => onNew(status)}><Plus size={15} /></button></div>
+    <div className="column-header"><div className={`column-status-icon status-${statusClass(status)}`}><ColumnIcon status={status} /></div><strong>{status}</strong><span className="column-count">{tasks.length}</span><button className="tiny-icon-button column-add" title={`Add to ${status}`} onClick={() => onNew(status)}><Plus size={15} /></button><button className="tiny-icon-button column-add" title="Manage column" onClick={() => { const action = window.prompt('Type: rename or delete', statusRecord.is_resolved ? 'rename' : 'rename'); if (action === 'rename' || action === 'delete') onManageStatus(project.id, statusRecord, action) }}><MoreHorizontal size={15} /></button></div>
     <div className="column-cards">{tasks.map((task) => <BoardTaskCard key={task.id} task={task} project={project} userId={userId} isAdmin={isAdmin} imageUrl={imageFor(task)} person={profileFor(task.owner_id)} onOpen={() => onOpen(task)} />)}{tasks.length === 0 && <div className="column-empty">Drop a card here</div>}</div>
     <button className="column-add-card" onClick={() => onNew(status)}><Plus size={15} /> Add card</button>
   </section>
@@ -711,29 +797,38 @@ function InsightTaskRow({ task, profiles, isAdmin, onClick }) {
   return <button className={`insight-task-row ${dateIsOverdue(task) ? 'insight-overdue-row' : ''}`} onClick={onClick}><span className="insight-row-status"><span className={`task-row-marker task-marker-${statusClass(task.status)}`} /></span><span className="insight-row-title"><strong>{task.title}</strong><small>{task.status} <span>·</span> {task.severity}</small></span>{task.important && <span className="important-badge"><Star size={12} fill="currentColor" /> Important</span>}<span className={`severity-chip severity-${task.severity.toLowerCase()}`}>{task.severity}</span>{isAdmin && person && <span className="insight-owner">{initials(person.display_name || person.email)} {person.display_name || person.email.split('@')[0]}</span>}<span className={`insight-due ${dateIsOverdue(task) ? 'is-overdue' : ''}`}><CalendarDays size={13} />{task.due_date ? formatDate(task.due_date, { month: 'short', day: 'numeric', year: 'numeric' }) : 'No due date'}</span><ArrowUpRight size={15} className="insight-row-arrow" /></button>
 }
 
-function TeamView({ profiles, projects, tasks, userId, onInvite }) {
+function TeamView({ profiles, projects, tasks, userId, onInvite, onCreate, onManage }) {
+  const manage = (person) => {
+    const action = window.prompt('Type edit, reset-password, or delete', 'edit')?.trim().toLowerCase();
+    if (action === 'edit') { const display_name = window.prompt('Member name', person.display_name || ''); if (display_name !== null) onManage({ action, id: person.id, display_name }); }
+    else if (action === 'reset-password') { const password = window.prompt('New password (at least 8 characters)'); if (password) onManage({ action, id: person.id, password }); }
+    else if (action === 'delete' && window.confirm('Delete this member and their account?')) onManage({ action, id: person.id });
+  }
   const members = [...profiles].sort((a, b) => (a.role === 'admin' ? -1 : 1) - (b.role === 'admin' ? -1 : 1) || (a.display_name || a.email).localeCompare(b.display_name || b.email))
   const memberTasks = (id) => tasks.filter((task) => task.owner_id === id)
   const openTasks = tasks.filter((task) => !DONE.has(task.status)).length
   const doneTasks = tasks.filter((task) => DONE.has(task.status)).length
   return <div className="page-view team-view">
-    <div className="page-heading"><div><p className="eyebrow">ADMIN CONSOLE</p><h1>Your team</h1><p className="page-subtitle">Invite members and keep an eye on activity across the workspace.</p></div><button className="primary-button" onClick={onInvite}><UserPlus size={16} /> Invite member</button></div>
+    <div className="page-heading"><div><p className="eyebrow">ADMIN CONSOLE</p><h1>Your team</h1><p className="page-subtitle">Invite members and keep an eye on activity across the workspace.</p></div><button className="secondary-button" onClick={onCreate}><Plus size={15} /> Add directly</button><button className="primary-button" onClick={onInvite}><UserPlus size={16} /> Invite member</button></div>
     <div className="stats-grid team-stats-grid"><StatCard label="Team members" value={profiles.length} hint="Invited to this workspace" icon={Users} tone="indigo" trend={<span className="stat-neutral">People</span>} /><StatCard label="Active projects" value={projects.length} hint="Across all team boards" icon={BriefcaseBusiness} tone="mint" trend={<span className="stat-neutral">Projects</span>} /><StatCard label="Open activities" value={openTasks} hint="Cards still moving through stages" icon={Activity} tone="amber" trend={<span className="stat-warn"><Clock3 size={12} /> In motion</span>} /><StatCard label="Completed" value={doneTasks} hint="Completed, delivered or closed" icon={CheckCircle2} tone="rose" trend={<span className="stat-good"><Check size={12} /> Shipped</span>} /></div>
-    <section className="surface team-table-panel"><div className="section-heading"><div><h2>People</h2><p>Members can manage their own projects and cards.</p></div><span className="count-pill">{members.length}</span></div><div className="team-table"><div className="team-table-head"><span>MEMBER</span><span>ROLE</span><span>PROJECTS</span><span>ACTIVITIES</span><span>JOINED</span><span /></div>{members.map((person, index) => { const ownedTasks = memberTasks(person.id); const ownedProjects = projects.filter((project) => project.created_by === person.id); return <div className="team-table-row" key={person.id}><span className="team-person-cell"><span className={`avatar avatar-tone-${index % 4}`}>{initials(person.display_name || person.email)}</span><span><strong>{person.display_name || person.email.split('@')[0]}</strong><small>{person.email}</small></span>{person.id === userId && <span className="you-chip">YOU</span>}</span><span><span className={`role-chip ${person.role === 'admin' ? 'role-admin' : ''}`}>{person.role === 'admin' ? <ShieldCheck size={12} /> : <Users size={12} />}{person.role === 'admin' ? 'Admin' : 'Member'}</span></span><span className="table-count">{ownedProjects.length}</span><span className="table-count">{ownedTasks.length}<small> · {ownedTasks.filter((task) => !DONE.has(task.status)).length} open</small></span><span className="table-date">{formatDate(person.created_at?.slice(0, 10), { month: 'short', day: 'numeric', year: 'numeric' })}</span><span><button className="team-row-more" title="Invite another member" onClick={onInvite}><MoreHorizontal size={17} /></button></span></div> })}</div><div className="team-table-foot"><ShieldCheck size={14} /> Roles are managed securely in Supabase. Admin access is not editable from the member directory.</div></section>
+    <section className="surface team-table-panel"><div className="section-heading"><div><h2>People</h2><p>Members can manage their own projects and cards.</p></div><span className="count-pill">{members.length}</span></div><div className="team-table"><div className="team-table-head"><span>MEMBER</span><span>ROLE</span><span>PROJECTS</span><span>ACTIVITIES</span><span>JOINED</span><span /></div>{members.map((person, index) => { const ownedTasks = memberTasks(person.id); const ownedProjects = projects.filter((project) => project.created_by === person.id); return <div className="team-table-row" key={person.id}><span className="team-person-cell"><span className={`avatar avatar-tone-${index % 4}`}>{initials(person.display_name || person.email)}</span><span><strong>{person.display_name || person.email.split('@')[0]}</strong><small>{person.email}</small></span>{person.id === userId && <span className="you-chip">YOU</span>}</span><span><span className={`role-chip ${person.role === 'admin' ? 'role-admin' : ''}`}>{person.role === 'admin' ? <ShieldCheck size={12} /> : <Users size={12} />}{person.role === 'admin' ? 'Admin' : 'Member'}</span></span><span className="table-count">{ownedProjects.length}</span><span className="table-count">{ownedTasks.length}<small> · {ownedTasks.filter((task) => !DONE.has(task.status)).length} open</small></span><span className="table-date">{formatDate(person.created_at?.slice(0, 10), { month: 'short', day: 'numeric', year: 'numeric' })}</span><span><button className="team-row-more" title="Manage member" onClick={() => manage(person)}><MoreHorizontal size={17} /></button></span></div> })}</div><div className="team-table-foot"><ShieldCheck size={14} /> Roles are managed securely in Supabase. Admin access is not editable from the member directory.</div></section>
     <div className="invite-callout"><div className="invite-callout-icon"><Mail size={18} /></div><div><strong>Need to add someone?</strong><p>Send an invite link. They’ll set their password and join as a member.</p></div><button className="secondary-button" onClick={onInvite}><UserPlus size={15} /> Invite member</button></div>
   </div>
 }
 
-function TaskModal({ task, projects, profiles, isAdmin, user, initialProjectId, initialStatus, imageUrl, onClose, onSave, onDelete }) {
+function TaskModal({ task, projects, profiles, isAdmin, user, statuses, checklist: initialChecklist, initialProjectId, initialStatus, imageUrl, onClose, onSave, onDelete }) {
+  const [checklistDraft, setChecklistDraft] = useState(() => initialChecklist ?? [])
+  const [checklistTitle, setChecklistTitle] = useState('')
   const [values, setValues] = useState(() => ({
     project_id: task?.project_id ?? initialProjectId ?? projects[0]?.id ?? '',
     owner_id: task?.owner_id ?? (isAdmin && projects.find((project) => project.id === (task?.project_id ?? initialProjectId))?.created_by) ?? user.id,
     title: task?.title ?? '',
     description: task?.description ?? '',
-    status: task?.status ?? initialStatus ?? 'Note started',
+    status: task?.status ?? initialStatus ?? statuses?.[0]?.name ?? 'Note started',
     severity: task?.severity ?? 'Medium',
     size: task?.size ?? 'M',
     due_date: task?.due_date ?? '',
+    due_time: task?.due_time?.slice(0, 5) ?? '',
     important: task?.important ?? false,
   }))
   const [file, setFile] = useState(null)
@@ -751,7 +846,7 @@ function TaskModal({ task, projects, profiles, isAdmin, user, initialProjectId, 
   const submit = async (event) => {
     event.preventDefault()
     setBusy(true); setError('')
-    try { await onSave({ values, file, removeImage, task }) }
+    try { await onSave({ values: { ...values, checklist: checklistDraft }, file, removeImage, task }) }
     catch (saveError) { setError(errorMessage(saveError)) }
     setBusy(false)
   }
@@ -761,8 +856,9 @@ function TaskModal({ task, projects, profiles, isAdmin, user, initialProjectId, 
       <div className="modal-heading"><div><p className="eyebrow">{task ? 'ACTIVITY CARD' : 'NEW ACTIVITY'}</p><h2>{task ? 'Update activity' : 'Create a card'}</h2><p>{task ? 'Keep details current as the work moves forward.' : 'Capture the next piece of work and give it a place on the board.'}</p></div><button type="button" className="modal-close" onClick={onClose}><X size={18} /></button></div>
       {projects.length === 0 ? <div className="form-notice"><FolderKanban size={17} /><span>Create a project first, then add activity cards to its board.</span></div> : <>
         <div className="task-form-top-grid"><label className="field-label">Card title<input autoFocus value={values.title} onChange={(event) => update('title', event.target.value)} placeholder="e.g. Prepare launch checklist" maxLength={180} required /></label><label className="field-label">Project<select value={values.project_id} onChange={(event) => { update('project_id', event.target.value); if (isAdmin && !task) update('owner_id', projects.find((project) => project.id === event.target.value)?.created_by ?? user.id) }}>{projects.map((project) => <option value={project.id} key={project.id}>{project.name}</option>)}</select></label></div>
-        <div className="task-form-select-grid"><label className="field-label">Status<select value={values.status} onChange={(event) => update('status', event.target.value)}>{STATUSES.map((status) => <option key={status}>{status}</option>)}</select></label><label className="field-label">Severity<select value={values.severity} onChange={(event) => update('severity', event.target.value)}>{SEVERITIES.map((severity) => <option key={severity}>{severity}</option>)}</select></label><label className="field-label">Size<select value={values.size} onChange={(event) => update('size', event.target.value)}>{SIZES.map((size) => <option key={size}>{size}</option>)}</select></label><label className="field-label">Due date<input type="date" value={values.due_date || ''} onChange={(event) => update('due_date', event.target.value)} /></label></div>
+        <div className="task-form-select-grid"><label className="field-label">Status<select value={values.status} onChange={(event) => update('status', event.target.value)}>{(statuses?.length ? statuses.map((item) => item.name) : STATUSES).map((status) => <option key={status}>{status}</option>)}</select></label><label className="field-label">Severity<select value={values.severity} onChange={(event) => update('severity', event.target.value)}>{SEVERITIES.map((severity) => <option key={severity}>{severity}</option>)}</select></label><label className="field-label">Size<select value={values.size} onChange={(event) => update('size', event.target.value)}>{SIZES.map((size) => <option key={size}>{size}</option>)}</select></label><label className="field-label">Due date<input type="date" value={values.due_date || ''} onChange={(event) => update('due_date', event.target.value)} /></label><label className="field-label">Due time (optional)<input type="time" value={values.due_time || ''} disabled={!values.due_date} onChange={(event) => update('due_time', event.target.value)} /></label></div>
         <label className="field-label description-label">Description<textarea value={values.description} onChange={(event) => update('description', event.target.value)} placeholder="Add context, next steps, or useful links…" rows={4} /></label>
+        <section className="checklist-editor"><div className="section-heading"><div><h3>Checklist</h3><p>{checklistDraft.filter((item) => item.is_done).length} of {checklistDraft.length} complete</p></div></div>{checklistDraft.map((item, index) => <label className="checklist-row" key={item.id || `draft-${index}`}><input type="checkbox" checked={item.is_done} onChange={(event) => setChecklistDraft((rows) => rows.map((row, rowIndex) => rowIndex === index ? { ...row, is_done: event.target.checked } : row))} /><span>{item.title}</span><button type="button" className="tiny-icon-button" title="Remove checklist item" onClick={() => setChecklistDraft((rows) => rows.filter((_, rowIndex) => rowIndex !== index))}><X size={14} /></button></label>)}<div className="checklist-add"><input value={checklistTitle} onChange={(event) => setChecklistTitle(event.target.value)} placeholder="Add a checklist item" onKeyDown={(event) => { if (event.key === 'Enter') { event.preventDefault(); if (checklistTitle.trim()) { setChecklistDraft((rows) => [...rows, { title: checklistTitle.trim(), is_done: false }]); setChecklistTitle('') } } }} /><button type="button" className="secondary-button" onClick={() => { if (checklistTitle.trim()) { setChecklistDraft((rows) => [...rows, { title: checklistTitle.trim(), is_done: false }]); setChecklistTitle('') } }}><Plus size={14} /> Add</button></div></section>
         {isAdmin && <div className="assigned-owner-row"><span className="avatar avatar-purple">{initials(profiles.find((person) => person.id === (projects.find((project) => project.id === values.project_id)?.created_by ?? values.owner_id))?.display_name || profiles.find((person) => person.id === (projects.find((project) => project.id === values.project_id)?.created_by ?? values.owner_id))?.email)}</span><span><small>CARD OWNER</small><strong>{profiles.find((person) => person.id === (projects.find((project) => project.id === values.project_id)?.created_by ?? values.owner_id))?.display_name || profiles.find((person) => person.id === (projects.find((project) => project.id === values.project_id)?.created_by ?? values.owner_id))?.email || 'Project owner'}</strong></span><span className="owner-note">Based on project</span></div>}
         <div className="task-form-bottom"><button type="button" className={`important-toggle ${values.important ? 'is-important' : ''}`} onClick={() => update('important', !values.important)}><Star size={15} fill={values.important ? 'currentColor' : 'none'} />{values.important ? 'Marked important' : 'Mark as important'}</button><label className="attachment-button"><ImagePlus size={15} />{shownImage ? 'Change image' : 'Attach image'}<input type="file" accept="image/jpeg,image/png,image/webp,image/gif" onChange={(event) => { setFile(event.target.files?.[0] ?? null); setRemoveImage(false) }} /></label></div>
         {shownImage && <div className="attachment-preview"><img src={shownImage} alt="Card attachment preview" /><div><strong>{file?.name || 'Image attachment'}</strong><small>Visible to people who can access this project.</small></div><button type="button" className="tiny-icon-button" title="Remove image" onClick={() => { setFile(null); setRemoveImage(true) }}><X size={15} /></button></div>}
@@ -794,6 +890,20 @@ function ProjectModal({ project, profiles, isAdmin, user, onClose, onSave, onDel
       <div className="modal-footer"><div>{onDelete && <button type="button" className="danger-text-button" onClick={onDelete}><Trash2 size={15} /> Delete project</button>}</div><div><button type="button" className="secondary-button" onClick={onClose}>Cancel</button><button className="primary-button" disabled={busy}>{busy && <LoaderCircle size={15} className="spin" />}{project ? 'Save project' : 'Create project'}<ArrowRight size={15} /></button></div></div>
     </form>
   </ModalShell>
+}
+
+function CreateMemberModal({ onClose, onCreate }) {
+  const [email, setEmail] = useState('')
+  const [display_name, setName] = useState('')
+  const [password, setPassword] = useState('')
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState('')
+  const submit = async (event) => {
+    event.preventDefault(); setBusy(true); setError('')
+    try { await onCreate({ email: email.trim(), display_name: display_name.trim(), password }) } catch (e) { setError(errorMessage(e)) }
+    setBusy(false)
+  }
+  return <ModalShell onClose={onClose}><form className="modal-form" onSubmit={submit}><div className="modal-heading"><div><p className="eyebrow">ADD TEAM MEMBER</p><h2>Create account</h2><p>Set an initial password and share it with the member securely.</p></div><button type="button" className="modal-close" onClick={onClose}><X size={18} /></button></div><label className="field-label">Name<input value={display_name} onChange={(e) => setName(e.target.value)} required /></label><label className="field-label">Email<input type="email" value={email} onChange={(e) => setEmail(e.target.value)} required /></label><label className="field-label">Initial password<input type="password" minLength={8} value={password} onChange={(e) => setPassword(e.target.value)} required /><small className="field-help">The current password cannot be viewed later. Admins can reset it.</small></label>{error && <div className="form-error"><AlertCircle size={15} />{error}</div>}<div className="modal-footer"><button type="button" className="secondary-button" onClick={onClose}>Cancel</button><button className="primary-button" disabled={busy}>{busy ? 'Creating…' : 'Create member'}</button></div></form></ModalShell>
 }
 
 function InviteModal({ onClose, onInvite }) {
