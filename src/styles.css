@@ -695,3 +695,11 @@ kbd { padding: 3px 5px; border: 1px solid #e7e8ed; border-radius: 4px; backgroun
   .login-panel { padding-right: 22px; padding-left: 22px; }
   .login-caption { display: none; }
 }
+.checklist-editor { margin: 18px 0; padding: 16px; border: 1px solid #e8eaf2; border-radius: 12px; background: #fafbff; }
+.checklist-editor .section-heading { margin: 0 0 10px; }
+.checklist-editor h3 { margin: 0; font-size: 14px; }
+.checklist-row { display: flex; align-items: center; gap: 9px; padding: 7px 0; color: #343a51; font-size: 13px; }
+.checklist-row span { flex: 1; }
+.checklist-row input { accent-color: #5b67e8; }
+.checklist-add { display: flex; gap: 8px; margin-top: 8px; }
+.checklist-add input { flex: 1; min-width: 0; border: 1px solid #e1e4ed; border-radius: 8px; padding: 9px 11px; font: inherit; }
